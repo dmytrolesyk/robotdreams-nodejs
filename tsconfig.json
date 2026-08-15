@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "noEmit": false,
+    "target": "esnext",
+    "module": "nodenext",
+    "rewriteRelativeImportExtensions": true,
+    "verbatimModuleSyntax": true,
+    "types": ["node"]
+  }
+}
