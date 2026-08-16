@@ -4,7 +4,6 @@ import {
   STATUS_CODES_MAP,
   type StatusCode,
   type ContentTypeAlias,
-  type RequestMetadata,
 } from './helpers.ts';
 
 export class Response {

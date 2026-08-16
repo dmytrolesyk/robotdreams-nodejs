@@ -1,0 +1,67 @@
+services:
+  node:
+    image: robotdreams-node:prod
+    build:
+      context: .
+      dockerfile: node.Dockerfile
+    environment:
+      PORT: ${NODE_PORT:-3000}
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: ${PG_USER:-postgres}
+      PGDATABASE: ${PG_DB:-sampledb}
+      # The secret arrives as a path — the app reads the file at startup so the
+      # password never lives in the environment.
+      PG_PASSWORD_FILE: /run/secrets/pg_password
+    secrets: [pg_password]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:alpine
+    ports: ['${HOST_PORT:-8443}:443']
+    environment:
+      NODE_PORT: ${NODE_PORT:-3000}
+    secrets: [tls_key, tls_cert]
+    healthcheck:
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      test: ['CMD', 'curl', '-fk', 'https://localhost/health']
+    volumes:
+      - ./nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    depends_on:
+      node:
+        condition: service_healthy
+
+  db:
+    build:
+      context: .
+      dockerfile: pg.Dockerfile
+    environment:
+      POSTGRES_USER: ${PG_USER:-postgres}
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+      POSTGRES_DB: ${PG_DB:-sampledb}
+    secrets: [pg_password]
+    ports:
+      - '5432:5432'
+    volumes:
+      - data_sql:/var/lib/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${PG_USER:-postgres} -d ${PG_DB:-sampledb}']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+# These files are gitignored; generate them with ./bootstrap.sh before the first `up`.
+secrets:
+  tls_key:
+    file: ./certs/key.pem
+  tls_cert:
+    file: ./certs/cert.pem
+  pg_password:
+    file: ./secrets/pg_password.txt
+
+volumes:
+  data_sql:
