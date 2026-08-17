@@ -1,0 +1,15 @@
+node_modules
+dist/
+.git
+*.md
+.env
+
+# Credentials stay out of the build context entirely — the services receive
+# them at runtime through compose secrets, never baked into an image layer.
+certs/
+secrets/
+*.pem
+*.key
+
+# Dockerfiles are not needed inside the images they build
+*.Dockerfile

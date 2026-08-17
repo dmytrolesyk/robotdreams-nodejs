@@ -1,151 +1,207 @@
-# HW-03 — Raw HTTP and HTTPS servers on TCP/TLS
+# HW-05 — Containerised HTTP service with Postgres
 
-A minimal HTTP/1.1 server built directly on `node:net`, with an HTTPS variant on
-`node:tls`. Neither `node:http` nor `node:https` is used anywhere — requests are
-parsed out of the raw byte stream and responses are serialized to bytes by hand.
-
-Both entry points share the same request parser, router and response builder;
-only the transport differs.
-
-## Requirements
-
-- Node.js 20.11+ (uses `import.meta.dirname` and native ESM)
+A minimal HTTP/1.1 server built directly on `node:net` — neither `node:http` nor
+any framework is used; requests are parsed out of the raw byte stream and
+responses are serialised to bytes by hand — packaged into a multi-stage image and
+run alongside Postgres and an nginx TLS terminator with a single command.
 
 ## Quick start
 
-### 1. Generate a self-signed certificate
-
-Required for the HTTPS server only. Run from the repository root:
-
 ```sh
-openssl req -x509 -newkey rsa:2048 -nodes \
-  -keyout src/key.pem -out src/cert.pem -days 365 \
-  -subj "/CN=localhost" \
-  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+./bootstrap.sh          # once per clone: generates the TLS cert and DB password
+docker compose up -d
 ```
 
-`key.pem` and `cert.pem` are listed in `.gitignore` and are not committed.
-
-Flag notes:
-
-- `-x509` produces a finished self-signed certificate instead of a signing request
-- `-nodes` leaves the private key unencrypted, so the server can read it without a passphrase
-- `-addext "subjectAltName=..."` is required by modern TLS clients, which ignore `CN`
-
-### 2. Run the servers
+`bootstrap.sh` needs only `openssl`. It is idempotent — running it again leaves
+existing credentials alone — and everything it writes is gitignored, so no
+secret ever enters the repository. See [Credentials](#credentials).
 
 ```sh
-node src/server.js        # http://localhost:3000
-node src/https-server.js  # https://localhost:3443
+curl -k https://localhost:8443/health   # 200, empty body
+curl -k https://localhost:8443/users    # 200, JSON array from Postgres
+curl -k https://localhost:8443/headers  # 200, the request headers as text
 ```
+
+`-k` is required: the certificate is self-signed. Stop with `docker compose down`
+(data survives) or `docker compose down -v` (data destroyed).
+
+## Architecture
+
+```
+curl ──TLS──▶ nginx :443 ──plain HTTP──▶ node :3000 ──▶ postgres :5432
+              holds the cert            no published    named volume
+                                        port            data_sql
+```
+
+TLS terminates at nginx, which is the only service published to the host. The
+Node process speaks plain HTTP on the internal Compose network and is
+unreachable from outside Docker; it learns the original scheme and client IP from
+the `X-Forwarded-*` headers nginx sets.
+
+| Service | Image | Published | Purpose |
+| --- | --- | --- | --- |
+| `nginx` | `nginx:alpine` | `8443 → 443` | TLS termination, reverse proxy |
+| `node` | `robotdreams-node:prod` | — | the application |
+| `db` | built from `pg.Dockerfile` | `5432` | Postgres 18, seeded on first init |
+
+## Image sizes
+
+| Build | Size |
+| --- | --- |
+| Single-stage, `node:24` (naive) | **1.75 GB** |
+| Multi-stage, `node:24-slim` (this repo) | **330 MB** |
+
+The multi-stage build ships only the bundled `dist/index.js` on a slim base,
+so the toolchain, `node_modules`, and TypeScript sources that the `builder` stage
+needs never reach the final image.
+
+Reproduce with:
+
+```sh
+docker compose -f compose.yaml build node
+docker images robotdreams-node:prod
+```
+
+## Dockerfile notes
+
+- **Multi-stage.** `builder` installs dev dependencies and runs `pnpm build`
+  (typecheck + bundle); `runner` copies only `dist/`. There is no install step in
+  the final stage at all — the bundler inlines runtime dependencies, so the image
+  carries no `node_modules`.
+- **Layer cache.** `COPY package.json pnpm-lock.yaml` and `pnpm install` come
+  before `COPY . .`, so editing a file under `src/` reuses the cached install
+  layer instead of resolving dependencies again.
+- **Non-root.** The final stage switches to `USER node`; verify with
+  `docker run --rm robotdreams-node:prod id -u` → `1000`.
+- **Healthcheck.** In the Dockerfile, requesting `/health` on the app's own port.
+
+## Development
+
+```sh
+docker compose watch
+```
+
+`compose.override.yaml` is merged automatically by `docker compose`. It builds
+the `builder` stage instead of `runner`, bind-mounts the project at `/build`,
+protects the image's `node_modules` with an anonymous volume, and runs
+`node --watch src/index.ts` as the `node` user.
+
+Hot reload goes through Compose's `develop.watch` rather than relying on
+`node --watch` alone: on macOS and Windows, bind mounts deliver file *contents*
+but not inotify *events*, so a watcher inside the container never learns that a
+host file changed. Compose watches on the host, where events work, and restarts
+the service. `docker compose watch` is therefore the command to use while
+developing — plain `up` gives you the mount without the reload.
+
+The base file stays usable on its own for CI:
+
+```sh
+docker compose -f compose.yaml config          # valid, no dev bind mounts
+docker compose -f compose.yaml up -d --wait
+```
+
+### Scripts
+
+| Command | Purpose |
+| --- | --- |
+| `pnpm stack:up` | build and start the production shape (no override) |
+| `pnpm stack:up:override` | build and start with dev overrides |
+| `pnpm stack:down` | stop, keeping volumes |
+| `pnpm stack:reset` | stop and destroy volumes |
+| `pnpm typecheck` | `tsc --noEmit` |
+| `pnpm build` | typecheck, then bundle with rolldown |
+| `pnpm node:dev` | run from source on the host |
+| `pnpm bootstrap` | generate the local certificate and DB password |
+
+## Data persistence
+
+Postgres data lives in the named volume `data_sql`, so it survives
+`docker compose down`. Verified with:
+
+```sh
+docker compose exec -T db psql -U postgres -d sampledb \
+  -c "INSERT INTO users (name, email) VALUES ('Persist Probe','persist@example.com') ON CONFLICT DO NOTHING;"
+
+docker compose down            # note: no -v
+docker compose up -d --wait
+
+docker compose exec -T db psql -U postgres -d sampledb \
+  -tAc "SELECT count(*) FROM users WHERE email='persist@example.com';"
+# → 1
+```
+
+`docker compose down -v` removes the volume and the next start re-runs
+`scripts/seed.sql`, since `/docker-entrypoint-initdb.d/` only executes when the
+data directory is empty.
+
+## Credentials
+
+Nothing sensitive is committed. `certs/` and `secrets/` are gitignored and
+produced locally by `./bootstrap.sh`:
+
+| File | Contents |
+| --- | --- |
+| `certs/key.pem`, `certs/cert.pem` | self-signed certificate for `localhost`, 365 days |
+| `secrets/pg_password.txt` | 24 random bytes from `openssl rand`, base64 |
+
+They reach the containers as Compose secrets:
+
+- Compose mounts each file as a secret at `/run/secrets/<name>`; no password is
+  ever passed through an environment variable, so nothing leaks into image
+  layers, `docker inspect`, or a serialised `process.env`.
+- Postgres receives `POSTGRES_PASSWORD_FILE` (the `_FILE` convention its
+  entrypoint implements) rather than `POSTGRES_PASSWORD`.
+- The app receives `PG_PASSWORD_FILE` and reads the file at startup in
+  `src/env.ts`, where a zod schema validates every environment variable and
+  transforms the path into the password. A missing or empty file fails the boot
+  with a message naming the variable, rather than surfacing later as a failed
+  query.
+
+A real deployment supplies real values through the same `secrets:` block —
+nothing about the application changes. `.dockerignore` also excludes `certs/`
+and `secrets/`, so the credentials cannot end up in an image layer even by
+accident, which is the failure mode that makes leaked secrets permanent.
+
+Regenerate at any time:
+
+```sh
+./bootstrap.sh --force
+```
+
+## Configuration
+
+`.env` holds only non-sensitive values and is committed; `.env.example`
+documents the same keys. Every reference in `compose.yaml` has a default, so the
+stack starts even with no `.env` present.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `NODE_PORT` | `3000` | port the app listens on, inside its container |
+| `HOST_PORT` | `8443` | host port mapped to nginx's `443` |
+| `PG_USER` | `postgres` | Postgres role, used by both `db` and `node` |
+| `PG_DB` | `sampledb` | database name, used by both `db` and `node` |
 
 ## Endpoints
 
 | Request | Response |
 | --- | --- |
-| `GET /` | `200 OK`, `Content-Type: text/plain` |
-| `GET /headers` | `200 OK`, parsed request headers as `name: value` lines (names lower-cased) |
-| anything else | `404 Not Found` |
-
-Every response is a well-formed HTTP/1.1 message: status line, `Content-Type`,
-`Content-Length`, `Connection`, a blank line, then the body.
-
-### Examples
-
-```sh
-curl -sv http://localhost:3000/
-curl -s -o /dev/null -w "%{http_code}\n" http://localhost:3000/nope
-curl -s http://localhost:3000/headers -H "X-Demo: abc"
-
-# HTTPS — -k is required, the certificate is self-signed
-curl -sk -o /dev/null -w "%{http_code}\n" https://localhost:3443/
-curl -sk https://localhost:3443/headers -H "X-Demo: abc"
-```
+| `GET /health` | `200`, empty body — used by the Docker healthcheck |
+| `GET /users` | `200`, `application/json`, rows from the seeded `users` table |
+| `GET /headers` | `200`, `text/plain`, the request headers one per line |
+| anything else | `404` |
 
 ## Project structure
 
-| File | Purpose |
+| Path | Purpose |
 | --- | --- |
-| `src/server.js` | HTTP entry point — creates the TCP transport via `net.createServer` |
-| `src/https-server.js` | HTTPS entry point — creates the TLS transport via `tls.createServer` |
-| `src/infra.js` | `HttpServer` and `Router` — connection handling, request parsing, routing |
-| `src/response.js` | `Response` — status, headers and body serialization to raw bytes |
-| `src/helpers.js` | status codes, content types, HTTP methods, shared types |
-
-The `.ts` sources next to each `.js` file are the originals; the `.js` files are
-what Node runs.
-
-## TLS debug session
-
-```sh
-openssl s_client -connect localhost:3443 -servername localhost
-```
-
-```
-Connecting to ::1
-CONNECTED(00000005)
-depth=0 CN=localhost
-verify error:num=18:self-signed certificate
-verify return:1
-depth=0 CN=localhost
-verify return:1
----
-Certificate chain
- 0 s:CN=localhost
-   i:CN=localhost
-   a:PKEY: RSA, 2048 (bit); sigalg: sha256WithRSAEncryption
-   v:NotBefore: Aug  8 18:18:51 2026 GMT; NotAfter: Aug  8 18:18:51 2027 GMT
----
-Server certificate
------BEGIN CERTIFICATE-----
-MIIDJTCCAg2gAwIBAgIUHt0buJi0YMIWqUzAeuKebZIdy6kwDQYJKoZIhvcNAQEL
-... (truncated) ...
-hyuuDu7n3o34BL/lHGz40khWMtSmaiXd7cOj7Nuk910BxRsUp0tXMpY=
------END CERTIFICATE-----
-subject=CN=localhost
-issuer=CN=localhost
----
-No client certificate CA names sent
-Peer signing digest: SHA256
-Peer signature type: rsa_pss_rsae_sha256
-Negotiated TLS1.3 group: X25519MLKEM768
----
-SSL handshake has read 2453 bytes and written 1620 bytes
-Verification error: self-signed certificate
----
-New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
-Protocol: TLSv1.3
-Server public key is 2048 bit
-This TLS version forbids renegotiation.
-Compression: NONE
-Expansion: NONE
-No ALPN negotiated
-Early data was not sent
-Verify return code: 18 (self-signed certificate)
----
-```
-
-### What `verify error:num=18` means
-
-Code **18** (`DEPTH_ZERO_SELF_SIGNED_CERT`) means the certificate at depth 0 is
-signed by its own private key rather than by a certificate authority in the
-client's trust store, so there is no chain to walk and the server's identity
-cannot be verified — which is exactly what is expected for a self-signed
-development certificate, and it affects authentication only: the session itself
-is still fully encrypted with `TLS_AES_256_GCM_SHA384` over TLS 1.3.
-
-The output shows this directly in the certificate chain, where subject and
-issuer are the same entity:
-
-```
- 0 s:CN=localhost
-   i:CN=localhost
-```
-
-For comparison, the related verification codes:
-
-| Code | Meaning |
-| --- | --- |
-| 18 | Self-signed certificate — the leaf signed itself, no chain at all |
-| 19 | Self-signed certificate in the chain — a chain exists but its root is not trusted (typically a missing intermediate) |
-| 10 | Certificate has expired — the chain is valid but `notAfter` has passed |
+| `src/index.ts` | routes and entry point |
+| `src/bootstrap.ts` | HTTP server and Postgres pool construction |
+| `src/env.ts` | zod-validated environment, reads the DB password from disk |
+| `src/server/` | `HttpServer`, `Router`, `Response` — raw HTTP/1.1 over TCP |
+| `node.Dockerfile` | multi-stage app image |
+| `pg.Dockerfile` | Postgres plus the seed script |
+| `compose.yaml` | base stack, CI-safe |
+| `compose.override.yaml` | dev overrides: bind mount, hot reload, non-root |
+| `nginx/default.conf.template` | TLS termination and reverse proxy config |
+| `scripts/seed.sql` | schema and sample rows, run on first DB init |
+| `bootstrap.sh` | generates local dev credentials (run once after cloning) |

@@ -74,16 +74,19 @@ export class HttpServer {
   private _port: number | undefined;
   private server: Server;
   private router: Router;
-  constructor(createTransport: TransportCreator, timeout = 5000) {
+  private sockets: Set<Socket> = new Set();
+  constructor(createTransport: TransportCreator, timeout = 3000) {
     this.server = createTransport(socket => {
       console.log('client connected');
+      this.sockets.add(socket);
       socket.setTimeout(timeout);
       socket.on('timeout', () => {
         console.log('socket timeout');
         socket.end();
       });
-      socket.on('end', () => {
+      socket.on('close', () => {
         console.log('client disconnected');
+        this.sockets.delete(socket);
       });
       this.parseRequest(socket);
     });
@@ -94,6 +97,17 @@ export class HttpServer {
   }
   get port() {
     return this._port;
+  }
+  close(onClose: () => void, gracePeriod = 5000) {
+    this.server.on('close', onClose);
+    this.server.close();
+    const forceCloseConnections = setTimeout(() => {
+      this.sockets.forEach(socket => {
+        socket.destroy();
+        this.sockets.delete(socket);
+      });
+    }, gracePeriod);
+    forceCloseConnections.unref();
   }
 
   private parseRequestMetadata(buf: Buffer): RequestMetadata | null {
